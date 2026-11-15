@@ -1,0 +1,217 @@
+-- ============================================
+-- Jules Class Go - Video Streaming Setup SQL
+-- Execute these commands in Supabase SQL Editor
+-- ============================================
+
+-- 1. CREATE VIDEO ACCESS TOKENS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS video_access_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  lesson_id UUID NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+  student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE,
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  ip_address TEXT,
+  user_agent TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_video_token ON video_access_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_video_expires ON video_access_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_video_lesson_student ON video_access_tokens(lesson_id, student_id);
+
+-- Enable RLS
+ALTER TABLE video_access_tokens ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy: Users can view their own tokens
+CREATE POLICY "Users view own tokens"
+ON video_access_tokens FOR SELECT
+USING (auth.uid() = student_id);
+
+
+-- 2. CREATE VIDEO ANALYTICS TABLE
+-- ============================================
+CREATE TABLE IF NOT EXISTS video_analytics (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  lesson_id UUID NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+  student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  watch_duration INTEGER DEFAULT 0,
+  last_position INTEGER DEFAULT 0,
+  completed BOOLEAN DEFAULT false,
+  watched_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes
+CREATE INDEX IF NOT EXISTS idx_video_analytics ON video_analytics(lesson_id, student_id);
+CREATE INDEX IF NOT EXISTS idx_video_analytics_completed ON video_analytics(completed);
+
+-- Enable RLS
+ALTER TABLE video_analytics ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policies
+CREATE POLICY "Users view own analytics"
+ON video_analytics FOR SELECT
+USING (auth.uid() = student_id);
+
+CREATE POLICY "Users insert own analytics"
+ON video_analytics FOR INSERT
+WITH CHECK (auth.uid() = student_id);
+
+CREATE POLICY "Users update own analytics"
+ON video_analytics FOR UPDATE
+USING (auth.uid() = student_id);
+
+
+-- 3. ALTER EXISTING LESSONS TABLE
+-- ============================================
+-- Add new columns for video metadata
+ALTER TABLE lessons
+ADD COLUMN IF NOT EXISTS storage_path TEXT,
+ADD COLUMN IF NOT EXISTS video_duration INTEGER,
+ADD COLUMN IF NOT EXISTS video_size BIGINT,
+ADD COLUMN IF NOT EXISTS thumbnail_url TEXT,
+ADD COLUMN IF NOT EXISTS processing_status TEXT DEFAULT 'ready';
+
+-- Create index on storage_path for quick lookups
+CREATE INDEX IF NOT EXISTS idx_lessons_storage_path ON lessons(storage_path);
+
+
+-- 4. ALTER ENROLLMENTS TABLE (Optional)
+-- ============================================
+-- Add video access control columns
+ALTER TABLE enrollments
+ADD COLUMN IF NOT EXISTS video_access_enabled BOOLEAN DEFAULT true,
+ADD COLUMN IF NOT EXISTS access_expires_at TIMESTAMP WITH TIME ZONE;
+
+
+-- 5. ROW LEVEL SECURITY FOR LESSONS
+-- ============================================
+-- Enable RLS on lessons table (if not already enabled)
+ALTER TABLE lessons ENABLE ROW LEVEL SECURITY;
+
+-- Drop existing policies if they exist (to avoid conflicts)
+DROP POLICY IF EXISTS "Students read enrolled lessons" ON lessons;
+DROP POLICY IF EXISTS "Teachers manage own lessons" ON lessons;
+DROP POLICY IF EXISTS "Public can read free lessons" ON lessons;
+
+-- Policy: Students can read lessons they're enrolled in OR free lessons
+CREATE POLICY "Students read enrolled lessons"
+ON lessons FOR SELECT
+USING (
+  -- Check if student is enrolled in the classroom
+  EXISTS (
+    SELECT 1 FROM enrollments
+    WHERE enrollments.classroom_id = lessons.classroom_id
+    AND enrollments.student_id = auth.uid()
+    AND enrollments.status = 'active'
+  )
+  -- OR if the lesson is free
+  OR lessons.is_free = true
+);
+
+-- Policy: Teachers can manage (CRUD) their own lessons
+CREATE POLICY "Teachers manage own lessons"
+ON lessons FOR ALL
+USING (
+  EXISTS (
+    SELECT 1 FROM classrooms
+    WHERE classrooms.id = lessons.classroom_id
+    AND classrooms.teacher_id = auth.uid()
+  )
+);
+
+
+-- 6. STORAGE BUCKET POLICIES
+-- ============================================
+-- Note: Storage buckets must be created in Supabase Dashboard first
+-- Then apply these policies via Dashboard → Storage → Policies
+
+-- Policy for videos-private bucket:
+-- CREATE POLICY "Authenticated users can upload videos"
+-- ON storage.objects FOR INSERT
+-- WITH CHECK (
+--   bucket_id = 'videos-private'
+--   AND auth.role() = 'authenticated'
+-- );
+
+-- Policy for reading videos (handled via signed URLs, not RLS)
+-- Videos are only accessible via signed URLs generated by the API
+
+
+-- 7. CLEANUP FUNCTION FOR EXPIRED TOKENS (Optional)
+-- ============================================
+-- Function to delete expired access tokens (run periodically)
+CREATE OR REPLACE FUNCTION cleanup_expired_tokens()
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+  DELETE FROM video_access_tokens
+  WHERE expires_at < NOW();
+END;
+$$;
+
+-- To manually run: SELECT cleanup_expired_tokens();
+-- To schedule: Create a cron job in Supabase (requires pg_cron extension)
+
+
+-- 8. FUNCTION TO UPDATE VIDEO ANALYTICS TIMESTAMP
+-- ============================================
+CREATE OR REPLACE FUNCTION update_video_analytics_timestamp()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$;
+
+-- Create trigger
+DROP TRIGGER IF EXISTS video_analytics_updated_at ON video_analytics;
+CREATE TRIGGER video_analytics_updated_at
+BEFORE UPDATE ON video_analytics
+FOR EACH ROW
+EXECUTE FUNCTION update_video_analytics_timestamp();
+
+
+-- 9. VERIFICATION QUERIES
+-- ============================================
+-- Run these to verify everything is set up correctly
+
+-- Check if tables exist
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public'
+AND table_name IN ('video_access_tokens', 'video_analytics');
+
+-- Check lessons table columns
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_name = 'lessons'
+AND column_name IN ('storage_path', 'video_duration', 'video_size', 'thumbnail_url', 'processing_status');
+
+-- Check RLS is enabled
+SELECT tablename, rowsecurity
+FROM pg_tables
+WHERE schemaname = 'public'
+AND tablename IN ('lessons', 'video_access_tokens', 'video_analytics');
+
+-- Check policies exist
+SELECT schemaname, tablename, policyname, cmd
+FROM pg_policies
+WHERE tablename IN ('lessons', 'video_access_tokens', 'video_analytics');
+
+
+-- ============================================
+-- SETUP COMPLETE
+-- ============================================
+-- Next steps:
+-- 1. Create storage buckets in Supabase Dashboard:
+--    - videos-private (PRIVATE, 500MB limit)
+--    - video-thumbnails (PUBLIC, optional)
+-- 2. Apply storage policies in Dashboard
+-- 3. Test API endpoints
+-- ============================================
